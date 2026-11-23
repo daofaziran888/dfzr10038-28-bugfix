@@ -107,6 +107,19 @@ def get_flow_trace(module: str, entry_id: int):
     return {"module": module, "entry_id": entry_id, "effects": effects}
 
 
+@router.get("/{module}/{entry_id}/backfill-ranges")
+def get_backfill_ranges(module: str, entry_id: int) -> dict[str, Any]:
+    """读取窗口模板的可回溯区间：已交付范围逐项可追到真实输入，缺输入时给出等待原因。"""
+    service = require_service(module)
+    reader = getattr(service, "backfill_ranges", None)
+    if reader is None:
+        raise HTTPException(status_code=404, detail=f"{service.ENTITY}不支持可回溯区间查询")
+    result = reader(entry_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"{service.ENTITY} {entry_id} 不存在或已归档")
+    return result
+
+
 @router.post("/{module}/{entry_id}/actions", response_model=ActionResult)
 def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResult:
     service = require_service(module)

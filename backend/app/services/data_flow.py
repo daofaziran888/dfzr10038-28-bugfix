@@ -11,6 +11,7 @@ import random
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from app.services.time_window import parse_feature_list
 from app.store import store
 
 # ---------------------------------------------------------------------------
@@ -59,39 +60,144 @@ def flow_reg_to_derive_to_window(feature_reg_id: int) -> list[FlowEffect]:
     feat_no = str(feature_reg_entry.get("特征编号", ""))
     feat_name = str(feature_reg_entry.get("特征名称", ""))
 
-    # 查找关联的衍生规则并启效
-    derive_rows = store.rows("derive_rule")
-    for row in derive_rows:
-        if str(row.get("输入特征", "")) and feat_name in str(row.get("输入特征", "")):
-            if row.get("status") == "草稿":
-                row["status"] = "生效中"
-                row["pending"] = True
-                row["abnormal"] = False
-                effects.append(FlowEffect(
-                    "启效规则", "derive_rule", int(row.get("id", 0)),
-                    f"特征 {feat_no} 注册后联动启效衍生规则 {row.get('规则编号','')}",
-                ))
-                # 同时联动时间窗口
-                _window_compute_for_derived(row, feat_no, effects)
+    # 按实际依赖查找关联的衍生规则并启效：输入特征按完整特征名精确匹配，
+    # 避免注册 refund_amount 误启 refund_amount_7d 之类的子串关联。
+    activated: list[dict[str, Any]] = []
+    for row in store.rows("derive_rule"):
+        if row.get("status") != "草稿":
+            continue
+        if feat_name and feat_name in parse_feature_list(row.get("输入特征")):
+            row["status"] = "生效中"
+            row["pending"] = True
+            row["abnormal"] = False
+            effects.append(FlowEffect(
+                "启效规则", "derive_rule", int(row.get("id", 0)),
+                f"特征 {feat_no} 注册后联动启效衍生规则 {row.get('规则编号','')}",
+            ))
+            activated.append(row)
+
+    # 同一事件内启效的全部输出一次性同步到窗口计算清单，
+    # 保证多个输出并发就绪时每个窗口只产出一个可核实的计算结果范围。
+    if activated:
+        _sync_windows_for_outputs(activated, f"feature_reg/{feat_no}", effects)
 
     return effects
 
 
-def _window_compute_for_derived(
-    derive_row: dict[str, Any], source_feat_no: str, effects: list[FlowEffect]
-):
-    """为已启效的衍生规则关联的时间窗口触发计算。"""
-    win_rows = store.rows("time_window")
-    output_feat = str(derive_row.get("输出特征", ""))
-    for wrow in win_rows:
-        if wrow.get("status") == "草稿":
+def _sync_windows_for_outputs(
+    derive_rows: list[dict[str, Any]], source: str, effects: list[FlowEffect]
+) -> None:
+    """把本次启效的衍生输出同步到关联窗口的计算清单，并按需启动窗口计算。
+
+    只触达特征清单里真实登记了这些输出的窗口，无关窗口保持原状；
+    同一窗口本次新就绪的多个输出合并为一个可核实的计算结果范围；
+    已交付过的范围不重复计算，部分就绪时标明尚缺输入。
+    """
+    ready: dict[str, dict[str, str]] = {}
+    for row in derive_rows:
+        for output in parse_feature_list(row.get("输出特征")):
+            ready.setdefault(output, {
+                "输出特征": output,
+                "规则编号": str(row.get("规则编号", "")),
+                "输入特征": str(row.get("输入特征", "")),
+            })
+    if not ready:
+        return
+
+    now = datetime.datetime.now().isoformat()
+    for wrow in store.rows("time_window"):
+        if wrow.get("status") not in ("草稿", "计算中"):
+            continue  # 已关闭/已废弃的窗口不再接受新的输入
+        required = parse_feature_list(wrow.get("特征列表"))
+        newly_ready = [feat for feat in required if feat in ready]
+        if not required or not newly_ready:
+            continue  # 非关联窗口保持原状
+
+        detail = wrow.setdefault("计算明细", {
+            "需求特征": required, "已接受特征": [], "尚缺输入": list(required), "已交付区间": [],
+        })
+        detail["需求特征"] = required
+        accepted = detail.setdefault("已接受特征", [])
+        delivered = detail.setdefault("已交付区间", [])
+        accepted_names = {str(item.get("特征", "")) for item in accepted}
+        delivered_names = {
+            feat for record in delivered for feat in record.get("覆盖特征", [])
+        }
+
+        # 记录实际接受的特征，逐项可追到真实输入
+        new_accepted: list[str] = []
+        for feat in newly_ready:
+            if feat not in accepted_names:
+                accepted.append({
+                    "特征": feat,
+                    "来源规则": ready[feat]["规则编号"],
+                    "真实输入": ready[feat]["输入特征"],
+                    "接受时间": now,
+                })
+                accepted_names.add(feat)
+                new_accepted.append(feat)
+
+        # 已交付过的范围不另算一次，只交付本次新就绪且尚未交付的特征
+        to_deliver = [feat for feat in newly_ready if feat not in delivered_names]
+        range_no = ""
+        if to_deliver:
+            range_no = f"{wrow.get('模板编号', '')}-R{len(delivered) + 1}"
+            delivered.append({
+                "范围编号": range_no,
+                "覆盖特征": to_deliver,
+                "来源输入": [dict(ready[feat]) for feat in to_deliver],
+                "交付时间": now,
+                "触发源": source,
+            })
+
+        missing = [feat for feat in required if feat not in accepted_names]
+        detail["尚缺输入"] = missing
+        template_no = str(wrow.get("模板编号", ""))
+        window_id = int(wrow.get("id", 0))
+        ready_desc = "、".join(newly_ready)
+        will_start = not missing and wrow.get("status") == "草稿"
+        if not (new_accepted or to_deliver or will_start):
+            continue  # 重放或重复触发：无变化则不产生新的副作用记录
+
+        if will_start:
             wrow["status"] = "计算中"
             wrow["pending"] = True
-            wrow["awakened_by"] = f"feature_reg/{source_feat_no}"
+            wrow["awakened_by"] = source
+            wrow["最近计算"] = now
             effects.append(FlowEffect(
-                "启动计算", "time_window", int(wrow.get("id", 0)),
-                f"衍生规则 {derive_row.get('规则编号','')} 启效联动窗口 {wrow.get('模板编号','')} 启动计算",
+                "启动计算", "time_window", window_id,
+                f"窗口 {template_no} 需求输入全部就绪（{ready_desc}），启动计算"
+                + (f"；交付范围 {range_no} 覆盖 {'、'.join(to_deliver)}" if to_deliver else ""),
             ))
+        elif not missing:
+            effects.append(FlowEffect(
+                "交付范围", "time_window", window_id,
+                f"窗口 {template_no} 新就绪输入 {ready_desc}，交付范围 {range_no} "
+                f"覆盖 {'、'.join(to_deliver)}（窗口保持计算中）",
+            ))
+        else:
+            effects.append(FlowEffect(
+                "部分就绪", "time_window", window_id,
+                f"窗口 {template_no} 已接受 {ready_desc}，尚缺输入 {'、'.join(missing)}"
+                + (f"；本次交付范围 {range_no} 覆盖 {'、'.join(to_deliver)}，"
+                   f"当前为部分覆盖，勿按全量回溯" if to_deliver else "，暂不启动计算"),
+            ))
+
+
+# ==================== 链路1b: 衍生规则启效→时间窗口计算清单 ====================
+
+
+@_register(
+    "derive_rule/启效规则 → time_window/启动计算",
+    desc="衍生规则启效后把输出同步到关联窗口计算清单，按实际依赖启动窗口计算。",
+)
+def flow_derive_to_window(derive_rule_id: int) -> list[FlowEffect]:
+    effects: list[FlowEffect] = []
+    dr = store.find("derive_rule", derive_rule_id)
+    if dr is None or dr.get("status") != "生效中":
+        return effects
+    _sync_windows_for_outputs([dr], f"derive_rule/{dr.get('规则编号', '')}", effects)
+    return effects
 
 
 # ============================ 链路2: 时间窗口→特征回溯→特征存储/监控 ============================
